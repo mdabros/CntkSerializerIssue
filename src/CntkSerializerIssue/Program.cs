@@ -11,10 +11,12 @@ namespace CntkSerializerIssue
         const string FeaturesName = "features";
         const string LabelsName = "labels";
         const string TargetsName = "targets";
+        const DataType DataTypeF32 = DataType.Float;
+        static DeviceDescriptor Device = DeviceDescriptor.CPUDevice;
 
         static void Main(string[] args)
         {
-            var d = DeviceDescriptor.CPUDevice;
+            // setup file paths.
             var repositoryRoot = @"..\..\..\..\..\";
 
             var channelNameToMapFilePath = new Dictionary<string, string>
@@ -26,27 +28,51 @@ namespace CntkSerializerIssue
             };
 
             var ctfFilePath = Path.Combine(repositoryRoot, @"mapfiles\TrainTargets.ctf");
-            var outputShape = 3;
-            var maxSweeps = int.MaxValue;
-            uint minibatchSize = 32;
 
+            //
+            // Setup input.
+            // 
+            var channelInputShape = new int[] { 28, 28, 1 };
+
+            var channelInputNDShape = NDShape.CreateNDShape(channelInputShape);
+            var channelNameToInput = channelNameToMapFilePath.Keys
+                .ToDictionary(n => n, n => Variable.InputVariable(channelInputNDShape, DataTypeF32, n));
+
+            var channelInputsVector = new VariableVector(channelNameToInput.Values);
+            // Splice input using channels -> (28, 28, 4).
+            var input = Splice(channelInputsVector, new Axis(2));
+            var inputScale = Constant.Scalar(DataTypeF32, 1.0 / byte.MaxValue, Device);
+            var inputNorm = ElementTimes(input, inputScale);
+
+            // Setup network.
+            var outputShape = 3;
+            var network = LinearModel(inputNorm, outputShape);
+                        
+            // setup loss.
+            Variable targets = Variable.InputVariable(new int[] { outputShape }, DataTypeF32);
+            var loss = MeanSquareError(targets, network);
+
+            // setup trainer.
+            var learner = SGDLearner(new ParameterVector(network.Parameters().ToList()),
+                new TrainingParameterScheduleDouble(0.001),
+                new AdditionalLearningOptions());
+            var trainer = CreateTrainer(network, loss, null, new LearnerVector() { learner });
+
+            // Setup minibatch source and stream infos.
+            var maxSweeps = int.MaxValue;
             var source = CreateTrainMinibatchSource(channelNameToMapFilePath, ctfFilePath, outputShape, maxSweeps);
-            var targetStreamInfoName = source.StreamInfo(TargetsName);
+
+            var channelNameToImageStreamInfo = channelNameToMapFilePath.ToDictionary(
+                p => p.Key, p => source.StreamInfo(p.Key + FeaturesName));
+            var targetsStreamInfo = source.StreamInfo(TargetsName);
+
+            uint minibatchSize = 32;
             var sweeps = 0;
+            var dataDictionary = new Dictionary<Variable, MinibatchData>();
 
             while (true)
             {
-                var minibatchData = source.GetNextMinibatch(minibatchSize, d);
-                var targets = minibatchData[targetStreamInfoName];
-
-                if(targets.sweepEnd)
-                {
-                    if (sweeps % 1000 == 0)
-                    {
-                        System.Console.WriteLine("Current sweep: " + sweeps);
-                    }
-                    sweeps++;
-                }
+                var minibatchData = source.GetNextMinibatch(minibatchSize, Device);
 
                 // Stop training once max epochs is reached.
                 if (minibatchData.empty())
@@ -54,10 +80,33 @@ namespace CntkSerializerIssue
                     System.Console.WriteLine($"Completed all {sweeps} sweeps");
                     break;
                 }
+
+                foreach (var channelName in channelNameToMapFilePath.Keys)
+                {
+                    var imageStreamInfo = channelNameToImageStreamInfo[channelName];
+                    var dataInput = channelNameToInput[channelName];
+                    var imageData = minibatchData[imageStreamInfo];
+                    dataDictionary[dataInput] = imageData;
+                }
+
+                var targetsData = minibatchData[targetsStreamInfo];
+                dataDictionary[targets] = targetsData;
+
+                trainer.TrainMinibatch(dataDictionary, Device);
+
+                if (targetsData.sweepEnd)
+                {
+                    if (sweeps % 1000 == 0)
+                    {
+                        System.Console.WriteLine($"Current sweep: {sweeps}. Loss: {trainer.PreviousMinibatchLossAverage()}");
+                    }
+                    sweeps++;
+                }
             }
 
             System.Console.ReadKey();
         }
+
 
         static MinibatchSource CreateTrainMinibatchSource(
             IReadOnlyDictionary<string, string> channelNameToMapFilePath, string ctfFilePath,
@@ -96,6 +145,31 @@ namespace CntkSerializerIssue
 
             var targetCtfDeserializer = CTFDeserializer(ctfFilePath, ctfStreamConfigurationVector);
             return targetCtfDeserializer;
+        }
+
+        static Function LinearModel(Variable input, int outputShape)
+        {
+            var inputFeatureCount = input.Shape.Dimensions.Aggregate((n, m) => n * m);
+            var bias = new Parameter(new int[] { outputShape }, DataTypeF32, 0, Device);
+
+            var weightInitializer = GlorotUniformInitializer(
+                CNTKLib.DefaultParamInitScale,
+                CNTKLib.SentinelValueForInferParamInitRank,
+                CNTKLib.SentinelValueForInferParamInitRank, 1);
+
+            var weights = new Parameter(new int[] { outputShape, inputFeatureCount },
+                DataTypeF32, weightInitializer, Device);
+
+            var flatten = Reshape(Flatten(input), new int[] { inputFeatureCount });
+            return Plus(bias, CNTKLib.Times(weights, flatten));
+        }
+
+        static Function MeanSquareError(Variable targets, Variable predictions)
+        {
+            var errors = CNTKLib.Minus(targets, predictions);
+            var squaredErrors = CNTKLib.Square(errors);
+            var result = CNTKLib.ReduceMean(squaredErrors, new Axis(NDShape.InferredDimension));
+            return result;
         }
     }
 }
